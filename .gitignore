@@ -1,4 +1,25 @@
-﻿__pycache__/
+﻿# Secrets — NUNCA commitar
+.env
+.env.local
+*.env
+*.nexus
+*.gateway
+.env.nexus
+.env.gateway
+*.key
+*.pem
+*.p12
+credentials*.json
+
+# Claude Code local config (pode conter API keys)
+.claude/settings.local.json
+
+# MCP config
+.mcp.json
+mcp_config.json
+
+# Python
+__pycache__/
 *.py[cod]
 *.class
 *.so
@@ -7,13 +28,21 @@ env/
 venv/
 ENV/
 .venv
+
+# Node
 node_modules/
-.DS_Store
+
+# Logs
 *.log
-.env
-.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
 *.swp
 *.swo
 *~
-.vscode/
-.idea/
