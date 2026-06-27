@@ -247,74 +247,54 @@ class ThreadSafeStateManager:
     
     async def get_state_snapshot(self) -> Dict[str, Any]:
         """Get complete state snapshot for backup."""
-        async with asyncio.gather(
-            self.positions_lock.acquire(),
-            self.candles_lock.acquire(),
-            self.cooldowns_lock.acquire(),
-            self.signals_lock.acquire()
-        ):
-            try:
-                # All locks are acquired here
-                return {
-                    'positions': self._positions.copy(),
-                    'candle_buffers': {
-                        f"{k[0]}_{k[1]}": list(v) 
-                        for k, v in self._candle_buffers.items()
-                    },
-                    'cooldowns': self._cooldowns.copy(),
-                    'last_signals': self._last_signals.copy(),
-                    'stats': self.stats.copy(),
-                    'timestamp': time.time()
-                }
-            finally:
-                # Release all locks
-                self.positions_lock.release()
-                self.candles_lock.release()
-                self.cooldowns_lock.release()
-                self.signals_lock.release()
+        async with self.positions_lock:
+            async with self.candles_lock:
+                async with self.cooldowns_lock:
+                    async with self.signals_lock:
+                        return {
+                            'positions': self._positions.copy(),
+                            'candle_buffers': {
+                                f"{k[0]}_{k[1]}": list(v) 
+                                for k, v in self._candle_buffers.items()
+                            },
+                            'cooldowns': self._cooldowns.copy(),
+                            'last_signals': self._last_signals.copy(),
+                            'stats': self.stats.copy(),
+                            'timestamp': time.time()
+                        }
     
     async def restore_state_snapshot(self, snapshot: Dict[str, Any]) -> None:
         """Restore state from snapshot."""
-        async with asyncio.gather(
-            self.positions_lock.acquire(),
-            self.candles_lock.acquire(),
-            self.cooldowns_lock.acquire(),
-            self.signals_lock.acquire()
-        ):
-            try:
-                # Restore positions
-                self._positions = snapshot.get('positions', {})
-                
-                # Restore candle buffers
-                buffers_data = snapshot.get('candle_buffers', {})
-                self._candle_buffers.clear()
-                for key_str, buffer_list in buffers_data.items():
-                    # Parse key back to tuple
-                    parts = key_str.rsplit('_', 1)
-                    if len(parts) == 2:
-                        symbol, timeframe = parts
-                        buffer_key = (symbol, timeframe)
-                        self._candle_buffers[buffer_key] = deque(
-                            buffer_list, maxlen=self.buffer_config.max_size
-                        )
-                
-                # Restore cooldowns
-                self._cooldowns = snapshot.get('cooldowns', {})
-                
-                # Restore last signals
-                self._last_signals = snapshot.get('last_signals', {})
-                
-                # Restore stats
-                self.stats.update(snapshot.get('stats', {}))
-                
-                log.info("State restored from snapshot successfully")
-                
-            finally:
-                # Release all locks
-                self.positions_lock.release()
-                self.candles_lock.release()
-                self.cooldowns_lock.release()
-                self.signals_lock.release()
+        async with self.positions_lock:
+            async with self.candles_lock:
+                async with self.cooldowns_lock:
+                    async with self.signals_lock:
+                        # Restore positions
+                        self._positions = snapshot.get('positions', {})
+                        
+                        # Restore candle buffers
+                        buffers_data = snapshot.get('candle_buffers', {})
+                        self._candle_buffers.clear()
+                        for key_str, buffer_list in buffers_data.items():
+                            # Parse key back to tuple
+                            parts = key_str.rsplit('_', 1)
+                            if len(parts) == 2:
+                                symbol, timeframe = parts
+                                buffer_key = (symbol, timeframe)
+                                self._candle_buffers[buffer_key] = deque(
+                                    buffer_list, maxlen=self.buffer_config.max_size
+                                )
+                        
+                        # Restore cooldowns
+                        self._cooldowns = snapshot.get('cooldowns', {})
+                        
+                        # Restore last signals
+                        self._last_signals = snapshot.get('last_signals', {})
+                        
+                        # Restore stats
+                        self.stats.update(snapshot.get('stats', {}))
+                        
+                        log.info("State restored from snapshot successfully")
 
 # Global state manager instance
 state_manager = ThreadSafeStateManager()
