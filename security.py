@@ -28,11 +28,10 @@ class SecurityManager:
         """
         self.encryption_key = encryption_key or os.getenv("NEXUS_ENCRYPTION_KEY")
         if not self.encryption_key:
-            # Generate a key based on machine-specific info
-            machine_id = os.environ.get("COMPUTERNAME", os.environ.get("HOSTNAME", "default"))
-            user_id = os.environ.get("USERNAME", os.environ.get("USER", "default"))
-            combined = f"{machine_id}_{user_id}_nexus_bot"
-            self.encryption_key = combined.encode()
+            log.warning("NEXUS_ENCRYPTION_KEY not set — generating ephemeral key (existing encrypted data will be lost)")
+            self.encryption_key = os.urandom(32).hex()
+        if isinstance(self.encryption_key, str):
+            self.encryption_key = self.encryption_key.encode()
         
         # Derive encryption key
         kdf = PBKDF2HMAC(

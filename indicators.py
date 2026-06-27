@@ -168,7 +168,9 @@ def analyze(ohlcv: list, timeframe: str, adx_min: float = 20.0) -> TFSignal:
     ts_col, o, h, l, c, vol = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3], arr[:, 4], arr[:, 5]
 
     # Indicadores
-    ema3  = ema(c, 3)
+    # EMA fast: 5 em 1m (3 em 1m = 3 minutos de dado = ruído puro)
+    ema_fast_p = 5 if timeframe == "1m" else 3
+    ema3  = ema(c, ema_fast_p)
     ema8  = ema(c, 8)
     ema21 = ema(c, 21)
     rsi_v = rsi(c, 7)

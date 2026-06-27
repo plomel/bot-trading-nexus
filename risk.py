@@ -1,6 +1,7 @@
 """
-Bot Trading Nexus — Gestão de Risco
-Calibrado para 10-20x leverage em meme coins.
+NexusScalpTrading Bot — Gestão de Risco
+Gestão conservadora: 1% risco/trade, leverage por categoria (meme 3x / main 5x).
+Circuit breaker duplo: emergências + perda horária de 3%.
 """
 from __future__ import annotations
 import time
@@ -24,11 +25,14 @@ class RiskManager:
         self.max_margin_pct = float(cfg.get("MAX_MARGIN_PCT", 5.0))         # % conta em margem por pos
         self.liq_buffer_pct = float(cfg.get("LIQUIDATION_BUFFER", 0.15))    # % buffer de liquidação
 
+        self.hourly_loss_trigger = float(cfg.get("HOURLY_LOSS_TRIGGER", 3.0))
+
         self._emergency_times: list[float] = []
         self._cb_until: float = 0.0
         self._daily_loss: float = 0.0
         self._daily_start_balance: float = 0.0
         self._day_key: str = ""
+        self._balance_snapshots: list[tuple[float, float]] = []  # (timestamp, balance)
 
     # ── Circuit Breaker ────────────────────────────────────────────────────────
 
@@ -61,9 +65,31 @@ class RiskManager:
             loss_pct = (self._daily_start_balance - current_balance) / self._daily_start_balance * 100
             self._daily_loss = max(0.0, loss_pct)
 
+        # Regista snapshot horário — mantém apenas últimas 2 horas
+        now = time.time()
+        self._balance_snapshots.append((now, current_balance))
+        self._balance_snapshots = [(t, b) for t, b in self._balance_snapshots if now - t < 7200]
+
     @property
     def daily_loss_exceeded(self) -> bool:
         return self._daily_loss >= self.daily_loss_cap
+
+    @property
+    def hourly_loss_exceeded(self) -> bool:
+        """True se a conta perdeu mais de hourly_loss_trigger% na última hora."""
+        if len(self._balance_snapshots) < 2:
+            return False
+        now = time.time()
+        one_hour_ago = now - 3600
+        old = [b for t, b in self._balance_snapshots if t <= one_hour_ago]
+        if not old:
+            return False
+        balance_1h_ago = old[-1]
+        current = self._balance_snapshots[-1][1]
+        if balance_1h_ago <= 0:
+            return False
+        loss_pct = (balance_1h_ago - current) / balance_1h_ago * 100
+        return loss_pct >= self.hourly_loss_trigger
 
     # ── Entry Gate ─────────────────────────────────────────────────────────────
 
@@ -73,6 +99,10 @@ class RiskManager:
             return False, f"Circuit breaker ativo — {mins}min restantes"
         if self.daily_loss_exceeded:
             return False, f"Daily loss cap atingido ({self._daily_loss:.1f}%)"
+        if self.hourly_loss_exceeded:
+            log.error(f"[CB] Perda horária >{self.hourly_loss_trigger:.0f}% — ativando circuit breaker")
+            self._cb_until = time.time() + self.cb_pause_sec
+            return False, f"Perda horária >{self.hourly_loss_trigger:.0f}% — circuit breaker ativado"
         return True, "ok"
 
     # ── Position Sizing ────────────────────────────────────────────────────────

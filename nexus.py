@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bot Trading Nexus — Scalping Assíncrono
+NexusScalpTrading Bot — Scalping Assíncrono
 WebSocket real-time · 10-20x leverage · Meme coins
 
 Uso:
@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 import time
+from logging.handlers import RotatingFileHandler
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,7 +47,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(Path(__file__).parent / "nexus.log", encoding="utf-8"),
+        RotatingFileHandler(Path(__file__).parent / "nexus.log", maxBytes=10*1024*1024, backupCount=5, encoding="utf-8"),
     ],
 )
 log = logging.getLogger("nexus")
@@ -77,10 +78,12 @@ _TG_CHAT_ID_RAW = os.getenv("TELEGRAM_CHAT_ID", "")
 MIN_SCORE        = float(os.getenv("MIN_SCORE", "45"))       # legado — sobreposto por categoria
 MIN_SCORE_MAIN   = float(os.getenv("MIN_SCORE_MAIN", "45"))  # BTC/ETH/SOL
 MIN_SCORE_MEME   = float(os.getenv("MIN_SCORE_MEME", "62"))  # meme coins — só setups fortes
-DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "10"))
+DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "10"))  # legado — display only
+MEME_LEVERAGE    = int(os.getenv("MEME_LEVERAGE", "3"))       # 3x para meme coins (volatilidade alta)
+MAIN_LEVERAGE    = int(os.getenv("MAIN_LEVERAGE", "5"))       # 5x para BTC/ETH/SOL
 MAX_LEVERAGE     = int(os.getenv("MAX_LEVERAGE", "20"))
 ENTRY_COOLDOWN   = int(os.getenv("ENTRY_COOLDOWN_SEC", "60"))
-MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS", "5"))
+MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS", "2"))       # conservador até 50+ trades paper
 MAX_MEME_OPEN    = int(os.getenv("MAX_MEME_OPEN", "1"))      # máx 1 meme coin simultânea
 ADX_MIN_TREND    = float(os.getenv("ADX_MIN_TREND", "20"))
 USE_TV_FEED      = os.getenv("USE_TV_FEED", "true").lower() == "true"
@@ -101,11 +104,26 @@ _CFG = {k: os.getenv(k, v) for k, v in {
     "CB_PAUSE_SEC": "7200",
     "MAX_MARGIN_PCT": "5.0",
     "LIQUIDATION_BUFFER": "0.15",
+    "HOURLY_LOSS_TRIGGER": "3.0",   # % de perda em 1h que ativa circuit breaker
 }.items()}
 MAX_RISK_PER_TRADE = float(_CFG["MAX_RISK_PER_TRADE"])
 MAX_DAILY_LOSS = float(_CFG["MAX_DAILY_LOSS"])
 MAX_MARGIN_PCT = float(_CFG["MAX_MARGIN_PCT"])
 ENTRY_COOLDOWN_SEC = ENTRY_COOLDOWN
+
+# Clamp configuration values to safe bounds
+MIN_SCORE = max(0, min(100, MIN_SCORE))
+MIN_SCORE_MAIN = max(0, min(100, MIN_SCORE_MAIN))
+MIN_SCORE_MEME = max(0, min(100, MIN_SCORE_MEME))
+MAX_LEVERAGE = max(1, min(100, MAX_LEVERAGE))
+MEME_LEVERAGE = max(1, min(MAX_LEVERAGE, MEME_LEVERAGE))
+MAIN_LEVERAGE = max(1, min(MAX_LEVERAGE, MAIN_LEVERAGE))
+MAX_POSITIONS = max(1, min(20, MAX_POSITIONS))
+MAX_MEME_OPEN = max(0, min(MAX_POSITIONS, MAX_MEME_OPEN))
+ENTRY_COOLDOWN = max(10, min(3600, ENTRY_COOLDOWN))
+ADX_MIN_TREND = max(5, min(50, ADX_MIN_TREND))
+TV_BONUS = max(0, min(50, TV_BONUS))
+FUNDING_MAX = max(0.00001, min(0.005, FUNDING_MAX))
 
 # Validate configuration
 config = {
@@ -126,23 +144,33 @@ config = {
 
 is_valid, errors = validate_configuration(config)
 if not is_valid:
-    log.error("Configuration validation failed:")
-    for error in errors:
-        log.error(f"  - {error}")
-    raise ValueError("Invalid configuration. Please check your .env file.")
+    _binance_errs  = [e for e in errors if "BINANCE" in e.upper()]
+    _telegram_errs = [e for e in errors if "TELEGRAM" in e.upper()]
+    _other_errs    = [e for e in errors if "BINANCE" not in e.upper() and "TELEGRAM" not in e.upper()]
+    if _other_errs or (not PAPER and (_binance_errs or _telegram_errs)):
+        log.error("Configuration validation failed:")
+        for _e in (_other_errs + ([] if PAPER else (_binance_errs + _telegram_errs))):
+            log.error(f"  - {_e}")
+        raise ValueError("Invalid configuration. Please check your .env file.")
+    if PAPER and _binance_errs:
+        log.warning("PAPER MODE: chaves Binance ausentes/inválidas — a usar endpoints públicos.")
+    if PAPER and _telegram_errs:
+        log.warning("PAPER MODE: Telegram não configurado — alertas desativados.")
 
-# Decrypt sensitive data if needed
-try:
-    API_KEY = sec_manager.decrypt_data(_API_KEY_RAW) if _API_KEY_RAW else ""
-    API_SECRET = sec_manager.decrypt_data(_API_SECRET_RAW) if _API_SECRET_RAW else ""
-    TG_TOKEN = sec_manager.decrypt_data(_TG_TOKEN_RAW) if _TG_TOKEN_RAW else ""
-    TG_CHAT_ID = sec_manager.decrypt_data(_TG_CHAT_ID_RAW) if _TG_CHAT_ID_RAW else ""
-except Exception as e:
-    log.warning(f"Failed to decrypt sensitive data, using raw values: {e}")
-    API_KEY = _API_KEY_RAW
-    API_SECRET = _API_SECRET_RAW
-    TG_TOKEN = _TG_TOKEN_RAW
-    TG_CHAT_ID = _TG_CHAT_ID_RAW
+# Load sensitive data — try to decrypt, fall back to plaintext
+def _try_decrypt(value: str) -> str:
+    """Tenta decifrar; se falhar (plaintext), usa o valor original."""
+    if not value:
+        return ""
+    try:
+        return sec_manager.decrypt_data(value)
+    except Exception:
+        return value
+
+API_KEY = _try_decrypt(_API_KEY_RAW)
+API_SECRET = _try_decrypt(_API_SECRET_RAW)
+TG_TOKEN = _try_decrypt(_TG_TOKEN_RAW)
+TG_CHAT_ID = _try_decrypt(_TG_CHAT_ID_RAW)
 
 # Pares configurados pelo utilizador (ex: PEPE, BONK, WIF)
 _RAW_PAIRS = [p.strip() for p in
@@ -200,6 +228,7 @@ shutdown_requested = False
 # Use thread-safe state manager
 # symbol → {entry, qty, side, sl, tp, leverage, opened, risk_usd}
 positions: dict = {}
+_positions_lock = asyncio.Lock()
 cooldowns: dict = {}  # symbol → expiry timestamp
 
 # Buffer de candles por (symbol, timeframe) → list of OHLCV
@@ -217,8 +246,15 @@ def _day_key() -> str:
 
 def _in_trading_session() -> bool:
     """Só abre novas posições entre 08:00-22:00 UTC (London + NY overlap)."""
-    hour = datetime.now(timezone.utc).hour
-    return 8 <= hour < 22
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        return False
+    return 8 <= now.hour < 22
+
+
+def _leverage_for(sym_short: str) -> int:
+    """Leverage conservador por categoria: meme coins 3x, blue-chips 5x."""
+    return min(MAX_LEVERAGE, MEME_LEVERAGE if sym_short in MEME_PAIRS else MAIN_LEVERAGE)
 
 
 async def _in_cooldown(symbol: str) -> bool:
@@ -256,13 +292,23 @@ async def resolve_symbols(exchange) -> None:
 
     resolved = []
     for raw in _RAW_PAIRS:
-        # Candidatos por ordem de preferência
-        candidates = [
-            f"{raw}/USDT:USDT",
-            f"1000{raw}/USDT:USDT",
-            f"{raw}/USDC:USDC",
-            f"1000{raw}/USDC:USDC",
-        ]
+        # Meme coins baratas (PEPE, BONK, SHIB, FLOKI…) usam prefixo "1000" na Binance.
+        # Tentar 1000{raw} primeiro para evitar apanhar um contrato {raw} errado.
+        is_meme = raw in MEME_PAIRS
+        if is_meme:
+            candidates = [
+                f"1000{raw}/USDT:USDT",
+                f"{raw}/USDT:USDT",
+                f"1000{raw}/USDC:USDC",
+                f"{raw}/USDC:USDC",
+            ]
+        else:
+            candidates = [
+                f"{raw}/USDT:USDT",
+                f"1000{raw}/USDT:USDT",
+                f"{raw}/USDC:USDC",
+                f"1000{raw}/USDC:USDC",
+            ]
         found = None
         for cand in candidates:
             if cand in markets:
@@ -283,19 +329,23 @@ async def resolve_symbols(exchange) -> None:
 # ── Exchange setup ─────────────────────────────────────────────────────────────
 
 async def create_exchange() -> ccxtpro.binanceusdm:
-    exchange = ccxtpro.binanceusdm({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
+    _cfg: dict = {
         "options": {
             "defaultType": "future",
             "adjustForTimeDifference": True,
         },
         "enableRateLimit": True,
         "recvWindow": 10000,
-    })
+    }
+    if API_KEY and API_SECRET:
+        _cfg["apiKey"] = API_KEY
+        _cfg["secret"] = API_SECRET
+    exchange = ccxtpro.binanceusdm(_cfg)
     if PAPER:
         log.warning("=" * 60)
         log.warning("  PAPER MODE — nenhuma ordem real será submetida")
+        if not API_KEY:
+            log.warning("  Sem API key — a usar endpoints públicos apenas")
         log.warning("=" * 60)
     return exchange
 
@@ -329,8 +379,11 @@ async def open_position(exchange, symbol: str, side: str, score: float,
         if meme_open >= MAX_MEME_OPEN:
             log.info(f"Skip {sym_short_check} — {meme_open} meme coin(s) já abertas (máx {MAX_MEME_OPEN})")
             return
-    if _in_cooldown(symbol):
+    if await _in_cooldown(symbol):
         return
+
+    # Leverage conservador por categoria (meme=3x, main=5x)
+    leverage = _leverage_for(sym_short_check)
 
     ok, reason = RISK.can_enter()
     if not ok:
@@ -374,10 +427,21 @@ async def open_position(exchange, symbol: str, side: str, score: float,
         if free < 0:
             log.warning(f"Negative free balance detected: {free}. Setting to 0.")
             free = 0.0
-            
+        total_usdt = float(balance_data.get("USDT", {}).get("total", free))
+        total_bnfcr = float(balance_data.get("BNFCR", {}).get("total", 0))
+        total_usdc = float(balance_data.get("USDC", {}).get("total", 0))
+        total = total_usdt + total_bnfcr + total_usdc
+        if total < free:
+            total = free
+
     except Exception as e:
-        log.error(f"fetch_balance falhou: {e}")
-        return
+        if PAPER:
+            log.warning(f"fetch_balance indisponível em paper mode — a usar saldo simulado: {e}")
+            free  = 200.0
+            total = 200.0
+        else:
+            log.error(f"fetch_balance falhou: {e}")
+            return
 
     log.info(f"Saldo disponível: ${free:.2f} (total=${total:.2f})")
     if free < 5:
@@ -397,7 +461,7 @@ async def open_position(exchange, symbol: str, side: str, score: float,
         log.error(f"fetch_ticker {symbol}: {e}")
         return
 
-    qty = RISK.compute_qty(price, sl, side, free, DEFAULT_LEVERAGE)
+    qty = RISK.compute_qty(price, sl, side, free, leverage)
     if qty <= 0:
         log.warning(f"qty=0 para {symbol} — skip")
         return
@@ -422,14 +486,14 @@ async def open_position(exchange, symbol: str, side: str, score: float,
     log.info(f"{'[PAPER] ' if PAPER else ''}OPEN {side} {symbol} "
              f"| qty={qty} entry~${price:.6f} SL=${sl:.6f} "
              f"TP1=${tp1:.6f}({tp1_pct:.2f}%) TP2=${tp2:.6f}({tp2_pct:.2f}%) "
-             f"| score={score:.0f} lev={DEFAULT_LEVERAGE}x")
+             f"| score={score:.0f} lev={leverage}x")
     await tg_async(
         f"{entry_emoji} <b>{'[PAPER] ' if PAPER else ''}ENTRADA {side}</b> — {sym_short}\n"
         f"💰 Preço: <code>${price:.6f}</code>\n"
         f"🛡 SL: <code>${sl:.6f}</code> ({sl_pct:.2f}%)\n"
         f"🎯 TP1: <code>${tp1:.6f}</code> ({tp1_pct:.2f}%) — 50%\n"
         f"🎯 TP2: <code>${tp2:.6f}</code> ({tp2_pct:.2f}%) — 50%\n"
-        f"📊 Score: {score:.0f}/100 · {DEFAULT_LEVERAGE}x leverage"
+        f"📊 Score: {score:.0f}/100 · {leverage}x leverage"
     )
 
     qty_half = float(exchange.amount_to_precision(symbol, qty / 2))
@@ -439,14 +503,14 @@ async def open_position(exchange, symbol: str, side: str, score: float,
         await state_manager.update_position(symbol, {
             "entry": price, "qty": qty, "qty_half": qty_half, "side": side,
             "sl": sl, "tp": tp2, "tp1": tp1, "tp2": tp2,
-            "tp1_hit": False, "leverage": DEFAULT_LEVERAGE,
+            "tp1_hit": False, "leverage": leverage,
             "opened": time.time(), "risk_usd": free * (RISK.max_risk_pct / 100),
             "paper": True,
         })
         positions[symbol] = {
             "entry": price, "qty": qty, "qty_half": qty_half, "side": side,
             "sl": sl, "tp": tp2, "tp1": tp1, "tp2": tp2,
-            "tp1_hit": False, "leverage": DEFAULT_LEVERAGE,
+            "tp1_hit": False, "leverage": leverage,
             "opened": time.time(), "risk_usd": free * (RISK.max_risk_pct / 100),
             "paper": True,
         }
@@ -455,7 +519,7 @@ async def open_position(exchange, symbol: str, side: str, score: float,
         return
 
     # Ordens reais
-    await set_leverage(exchange, symbol, DEFAULT_LEVERAGE)
+    await set_leverage(exchange, symbol, leverage)
     ccxt_side = "buy" if side == "LONG" else "sell"
     close_side = "sell" if side == "LONG" else "buy"
 
@@ -490,7 +554,7 @@ async def open_position(exchange, symbol: str, side: str, score: float,
             # Regista posição com flag emergency para monitorização manual
             positions[symbol] = {
                 "entry": entry_price, "qty": qty, "side": side,
-                "sl": 0.0, "tp": tp, "leverage": DEFAULT_LEVERAGE,
+                "sl": 0.0, "tp": tp, "leverage": leverage,
                 "opened": time.time(), "emergency": True,
             }
             st.save_positions(positions)
@@ -516,17 +580,32 @@ async def open_position(exchange, symbol: str, side: str, score: float,
     await state_manager.update_position(symbol, {
         "entry": entry_price, "qty": qty, "qty_half": qty_half, "side": side,
         "sl": sl, "tp": tp2, "tp1": tp1, "tp2": tp2,
-        "tp1_hit": False, "leverage": DEFAULT_LEVERAGE,
+        "tp1_hit": False, "leverage": leverage,
         "opened": time.time(), "risk_usd": free * (RISK.max_risk_pct / 100),
     })
     positions[symbol] = {
         "entry": entry_price, "qty": qty, "qty_half": qty_half, "side": side,
         "sl": sl, "tp": tp2, "tp1": tp1, "tp2": tp2,
-        "tp1_hit": False, "leverage": DEFAULT_LEVERAGE,
+        "tp1_hit": False, "leverage": leverage,
         "opened": time.time(), "risk_usd": free * (RISK.max_risk_pct / 100),
     }
     st.save_positions(positions)
     await _set_cooldown(symbol)
+
+
+def _notify_nexos_event(event: dict) -> None:
+    """Fire-and-forget POST para NexOS porta 8767. Ignora erros silenciosamente."""
+    try:
+        data = json.dumps(event).encode("utf-8")
+        req = urllib.request.Request(
+            "http://localhost:8767/nexos-event",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=1)
+    except Exception:
+        pass  # NexOS pode não estar a correr — não bloquear o bot
 
 
 async def close_position(exchange, symbol: str, reason: str = "manual") -> None:
@@ -540,6 +619,12 @@ async def close_position(exchange, symbol: str, reason: str = "manual") -> None:
     side = pos["side"]
     qty  = pos["qty"]
     close_side = "sell" if side == "LONG" else "buy"
+
+    # Cancelar ordens SL/TP abertas para evitar execução tardia
+    try:
+        await exchange.cancel_all_orders(symbol)
+    except Exception as e:
+        log.debug(f"Cancel orders {symbol}: {e}")
 
     if not PAPER:
         try:
@@ -768,7 +853,7 @@ async def heartbeat_logger() -> None:
                     if recent else "  (sem sinais recentes)"
                 )
                 await tg_async(
-                    f"🤖 <b>NEXUS {mode_str} · Heartbeat</b>\n"
+                    f"🤖 <b>NexusScalpTrading Bot {mode_str} · Heartbeat</b>\n"
                     f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
                     f"📊 Posições: {pos_tg}\n"
                     f"🔎 Sinais:\n{sig_tg}\n"
@@ -952,6 +1037,7 @@ async def preload_candles(exchange) -> None:
                 candles = await exchange.fetch_ohlcv(symbol, tf, limit=100)
                 if candles:
                     candle_buf[(symbol, tf)] = candles
+                    await state_manager.update_candle_buffer(symbol, tf, candles)
                     loaded += 1
             except Exception as e:
                 log.warning(f"  preload {symbol} {tf}: {e}")
@@ -978,11 +1064,12 @@ async def preload_candles(exchange) -> None:
         adx_v = sig5.adx if sig5 else 0
         bar = _score_bar(score)
         arrow = _dir_arrow(direction)
-        flag = "→ CANDIDATO!" if score >= MIN_SCORE else ""
+        _min_req = MIN_SCORE_MEME if sym_short in MEME_PAIRS else MIN_SCORE_MAIN
+        flag = "→ CANDIDATO!" if score >= _min_req else ""
         log.info(f"  {sym_short:<6} {arrow:<10} score={score:5.1f} [{bar}] RSI={rsi_v:.0f} ADX={adx_v:.0f} {flag}")
         emoji = "🟢" if direction == "LONG" else "🔴" if direction == "SHORT" else "⚪"
         tg_lines.append(f"{emoji} <b>{sym_short}</b>  {arrow}  score={score:.0f}  RSI={rsi_v:.0f}")
-        if score >= MIN_SCORE:
+        if score >= _min_req:
             candidates.append(sym_short)
     log.info("─" * 55)
 
@@ -990,7 +1077,7 @@ async def preload_candles(exchange) -> None:
     mode_str = "📋 PAPER" if PAPER else "⚡ LIVE"
     cand_str = f"\n\n⚠️ <b>Candidatos:</b> {', '.join(candidates)}" if candidates else ""
     tg(
-        f"🚀 <b>Nexus {mode_str} online</b>\n"
+        f"🚀 <b>NexusScalpTrading Bot {mode_str} online</b>\n"
         f"<i>{datetime.now().strftime('%H:%M')} · {len(WATCH_PAIRS)} pares · {DEFAULT_LEVERAGE}x</i>\n\n"
         + "\n".join(tg_lines)
         + cand_str
@@ -1132,6 +1219,14 @@ async def position_monitor(exchange) -> None:
                                 f"💰 Preço: <code>${price:.6f}</code>\n"
                                 f"📈 PnL estimado: <code>${pnl:.4f}</code>"
                             )
+                            # Notificar NexOS dashboard (porta 8767, fire-and-forget)
+                            _notify_nexos_event({
+                                "type": "trade_closed",
+                                "symbol": sym_short,
+                                "pnl": round(pnl, 4),
+                                "reason": hit_reason,
+                                "paper": True,
+                            })
                             st.append_history({
                                 "symbol": sym, "side": side,
                                 "entry": entry, "exit": price,
@@ -1142,7 +1237,7 @@ async def position_monitor(exchange) -> None:
                             })
                             positions.pop(sym, None)
                             st.save_positions(positions)
-                            _set_cooldown(sym)
+                            await _set_cooldown(sym)
                     except Exception as e:
                         log.debug(f"paper monitor {sym}: {e}")
                 continue
@@ -1173,7 +1268,7 @@ async def position_monitor(exchange) -> None:
                     })
                     positions.pop(sym, None)
                     st.save_positions(positions)
-                    _set_cooldown(sym)
+                    await _set_cooldown(sym)
                     continue
 
                 # Verificar se próximo da liquidação + breakeven stop
@@ -1271,7 +1366,7 @@ async def _reconcile_positions(exchange) -> None:
                     })
                     positions.pop(sym, None)
                     st.save_positions(positions)
-                    _set_cooldown(sym)
+                    await _set_cooldown(sym)
                     await tg_async(
                         f"✅ <b>RECONCILIAÇÃO: Posição removida</b> — {sym_short}\n"
                         f"Posição foi fechada na exchange mas não no bot."
@@ -1282,44 +1377,179 @@ async def _reconcile_positions(exchange) -> None:
         raise  # Re-raise to be handled by caller
 
 
-# ── Dashboard simples (HTTP) ───────────────────────────────────────────────────
+# ── Dashboard (HTTP) ──────────────────────────────────────────────────────────
+
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NexusScalpTrading Bot</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#c9d1d9;font-family:'Cascadia Code',monospace,monospace;font-size:13px;padding:16px}
+h1{color:#58a6ff;font-size:1.1rem;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.badge{padding:2px 8px;border-radius:4px;font-size:.7rem;font-weight:700;letter-spacing:.04em}
+.paper{background:#1f3558;color:#79c0ff}.live{background:#3d1010;color:#ff7b72}
+.ok{color:#3fb950}.warn{color:#e3b341}.err{color:#f85149}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px;margin:12px 0}
+.card{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:10px 12px}
+.cv{font-size:1.25rem;font-weight:700;margin-bottom:2px}.cl{font-size:.68rem;color:#8b949e}
+table{width:100%;border-collapse:collapse;margin:8px 0}
+th{text-align:left;color:#8b949e;font-size:.7rem;padding:4px 8px;border-bottom:1px solid #21262d;text-transform:uppercase}
+td{padding:5px 8px;border-bottom:1px solid #161b22}
+.long{color:#3fb950}.short{color:#f85149}.neutral{color:#8b949e}
+.sec{margin:18px 0 6px;color:#8b949e;font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid #21262d;padding-bottom:4px}
+#ts{float:right;font-size:.7rem;color:#484f58;margin-top:4px}
+.bar{color:#21262d;font-size:.75rem}
+.no-data{color:#484f58;padding:8px 0;font-style:italic}
+</style>
+</head>
+<body>
+<h1>🤖 NexusScalpTrading Bot <span id="badge"></span><span id="ts"></span></h1>
+<div id="root">A carregar...</div>
+<script>
+function fmt(s){if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';}
+function bar(score){const f=Math.max(0,Math.min(10,Math.round((score||0)/10)));return'█'.repeat(f)+'░'.repeat(10-f);}
+function render(d){
+  document.getElementById('badge').innerHTML='<span class="badge '+(d.mode==='PAPER'?'paper':'live')+'">'+d.mode+'</span>';
+  document.getElementById('ts').textContent='↻ '+new Date(d.timestamp*1000).toLocaleTimeString();
+  const cbCls=d.circuit_breaker?'err':'ok';
+  const cbTxt=d.circuit_breaker?'CB ATIVO – '+d.cb_remaining_min+'min restantes':'OK';
+  const dlv=(d.daily_loss_pct||0).toFixed(2);
+  const dlCls=d.daily_loss_pct>5?'err':d.daily_loss_pct>2?'warn':'ok';
+  const nPos=d.positions?Object.keys(d.positions).length:0;
+  let h=`<div class="grid">
+    <div class="card"><div class="cv ${cbCls}">${cbTxt}</div><div class="cl">Circuit Breaker</div></div>
+    <div class="card"><div class="cv ${dlCls}">${dlv}%</div><div class="cl">Perda diária (cap ${d.daily_loss_cap??8}%)</div></div>
+    <div class="card"><div class="cv">${nPos} / ${d.max_positions??2}</div><div class="cl">Posições abertas</div></div>
+    <div class="card"><div class="cv">${d.leverage_main??'?'}x / ${d.leverage_meme??'?'}x</div><div class="cl">Leverage main / meme</div></div>
+  </div>`;
+  // Positions
+  h+='<div class="sec">Posições abertas</div>';
+  const pos=Object.entries(d.positions||{});
+  if(!pos.length){h+='<div class="no-data">Nenhuma posição aberta.</div>';}
+  else{
+    h+='<table><tr><th>Par</th><th>Side</th><th>Lev</th><th>Entry</th><th>SL</th><th>TP2</th><th>Risco $</th><th>Idade</th></tr>';
+    pos.forEach(([sym,p])=>{
+      const age=p.opened?fmt(Math.max(0,Math.round(Date.now()/1000-p.opened))):'—';
+      const sc=p.side==='LONG'?'long':'short';
+      h+=`<tr><td>${sym.split('/')[0]}</td><td class="${sc}">${p.side}</td><td>${p.leverage??'?'}x</td>`+
+        `<td>$${(p.entry||0).toFixed(5)}</td><td>$${(p.sl||0).toFixed(5)}</td>`+
+        `<td>$${(p.tp2||p.tp||0).toFixed(5)}</td><td>$${(p.risk_usd||0).toFixed(2)}</td><td>${age}</td></tr>`;
+    });
+    h+='</table>';
+  }
+  // Signals
+  h+='<div class="sec">Últimos sinais</div>';
+  const sigs=Object.entries(d.last_signals||{}).sort((a,b)=>b[1].score-a[1].score);
+  if(!sigs.length){h+='<div class="no-data">Sem sinais recentes.</div>';}
+  else{
+    h+='<table><tr><th>Par</th><th>Direção</th><th>Score</th><th>Mín. req.</th><th>Há</th></tr>';
+    sigs.forEach(([sym,s])=>{
+      const isMeme=(d.meme_pairs||[]).some(m=>sym.includes(m));
+      const minR=isMeme?(d.min_score_meme??62):(d.min_score_main??45);
+      const ok=s.score>=minR;
+      const dc=s.direction==='LONG'?'long':s.direction==='SHORT'?'short':'neutral';
+      h+=`<tr><td>${sym.split('/')[0]}</td><td class="${dc}">${s.direction}</td>`+
+        `<td>${(s.score||0).toFixed(1)} <span class="bar">${bar(s.score)}</span></td>`+
+        `<td class="${ok?'ok':'neutral'}">${minR}${ok?' ✓':''}</td><td>${fmt(s.ago_sec||0)}</td></tr>`;
+    });
+    h+='</table>';
+  }
+  // Config
+  h+='<div class="sec">Configuração</div><div class="grid">';
+  h+=`<div class="card"><div class="cv">${d.min_score_main??'—'}</div><div class="cl">MIN_SCORE main (BTC/ETH/SOL)</div></div>`;
+  h+=`<div class="card"><div class="cv">${d.min_score_meme??'—'}</div><div class="cl">MIN_SCORE meme coins</div></div>`;
+  h+=`<div class="card"><div class="cv">${d.max_meme_open??'—'}</div><div class="cl">Max meme simultâneas</div></div>`;
+  h+=`<div class="card"><div class="cv">${d.entry_cooldown_sec??'—'}s</div><div class="cl">Entry cooldown</div></div>`;
+  h+=`</div><div style="color:#484f58;font-size:.7rem;margin-top:14px">TV feed: ${d.tv_feed?'ON':'OFF'} · Pares: ${(d.pairs||[]).map(p=>p.split('/')[0]).join(', ')}</div>`;
+  document.getElementById('root').innerHTML=h;
+}
+let cd=10;
+async function upd(){
+  try{const r=await fetch('/status');const d=await r.json();render(d);cd=10;}
+  catch(e){document.getElementById('ts').textContent='⚠ erro de ligação';}
+}
+upd();
+setInterval(()=>{cd--;document.getElementById('ts').textContent=`↻ ${cd}s`;if(cd<=0)upd();},1000);
+</script>
+</body>
+</html>"""
+
 
 async def dashboard_server() -> None:
-    """Servidor HTTP mínimo na porta 8766 com estado em JSON."""
+    """Dashboard HTTP: / → HTML, /status → JSON, /favicon.ico → 204."""
     from aiohttp import web
 
-    async def handle(request):
-        data = {
-            "mode": "PAPER" if PAPER else "LIVE",
-            "leverage": DEFAULT_LEVERAGE,
-            "positions": positions,
-            "last_signals": {k: {"direction": v[0], "score": v[1],
-                                  "ago_sec": int(time.time() - v[2])}
-                             for k, v in last_signal.items()},
-            "circuit_breaker": RISK.circuit_breaker_active,
-            "cb_remaining_min": int(RISK.cb_seconds_remaining / 60),
-            "pairs": WATCH_PAIRS,
-            "min_score": MIN_SCORE,
-            "tv_feed": tv_available() and USE_TV_FEED,
-        }
+    async def handle_html(request):
         return web.Response(
-            text=json.dumps(data, indent=2),
-            content_type="application/json",
-            headers={"Access-Control-Allow-Origin": "*"},
+            text=_DASHBOARD_HTML,
+            content_type="text/html",
+            headers={"Cache-Control": "no-store"},
         )
 
+    async def handle_json(request):
+        try:
+            async with _positions_lock:
+                snap_pos = dict(positions)          # snapshot — evita race condition
+            snap_sig = dict(last_signal)        # snapshot
+            now = time.time()
+            data = {
+                "timestamp": now,
+                "mode": "PAPER" if PAPER else "LIVE",
+                "leverage_main": MAIN_LEVERAGE,
+                "leverage_meme": MEME_LEVERAGE,
+                "positions": snap_pos,
+                "last_signals": {
+                    k: {
+                        "direction": v[0],
+                        "score": round(v[1], 2),
+                        "ago_sec": max(0, int(now - v[2])),   # nunca negativo
+                    }
+                    for k, v in snap_sig.items()
+                },
+                "circuit_breaker": RISK.circuit_breaker_active,
+                "cb_remaining_min": int(RISK.cb_seconds_remaining / 60),
+                "daily_loss_pct": round(RISK._daily_loss, 3),
+                "daily_loss_cap": MAX_DAILY_LOSS,
+                "pairs": WATCH_PAIRS,
+                "meme_pairs": list(MEME_PAIRS),
+                "min_score_main": MIN_SCORE_MAIN,
+                "min_score_meme": MIN_SCORE_MEME,
+                "max_positions": MAX_POSITIONS,
+                "max_meme_open": MAX_MEME_OPEN,
+                "entry_cooldown_sec": ENTRY_COOLDOWN_SEC,
+                "tv_feed": tv_available() and USE_TV_FEED,
+            }
+            return web.Response(
+                text=json.dumps(data, indent=2, default=str),  # default=str evita crash em tipos inesperados
+                content_type="application/json",
+                headers={"Access-Control-Allow-Origin": "null"},
+            )
+        except Exception as e:
+            log.error(f"Dashboard /status erro: {e}")
+            return web.Response(
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
+                status=500,
+            )
+
+    async def handle_favicon(request):
+        return web.Response(status=204)     # silencia 404 no log
+
     app = web.Application()
-    app.router.add_get("/", handle)
-    app.router.add_get("/status", handle)
+    app.router.add_get("/", handle_html)
+    app.router.add_get("/status", handle_json)
+    app.router.add_get("/favicon.ico", handle_favicon)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Bind to localhost only for security
     site = web.TCPSite(runner, "127.0.0.1", 8766)
     try:
         await site.start()
-        log.info("Dashboard: http://127.0.0.1:8766/status (localhost only for security)")
+        log.info("Dashboard: http://127.0.0.1:8766/ (localhost only)")
     except OSError as e:
-        log.warning(f"Dashboard não iniciado (porta 8766 ocupada — instância anterior ainda ativa?): {e}")
+        log.warning(f"Dashboard não iniciado (porta 8766 ocupada): {e}")
         await runner.cleanup()
         return
     while True:
@@ -1332,11 +1562,11 @@ async def main() -> None:
     global shutdown_requested, telegram_handler, shutdown_manager
     
     print("=" * 60)
-    print("  Bot Trading Nexus — Scalping Assíncrono")
+    print("  NexusScalpTrading Bot — Scalping Assíncrono")
     print(f"  Modo: {'PAPER (sem ordens reais)' if PAPER else 'LIVE'}")
     print(f"  Pares pedidos: {', '.join(_RAW_PAIRS)}")
     print(f"  TFs: {', '.join(TIMEFRAMES)}")
-    print(f"  Leverage: {DEFAULT_LEVERAGE}x (max {MAX_LEVERAGE}x)")
+    print(f"  Leverage: main={MAIN_LEVERAGE}x · meme={MEME_LEVERAGE}x (max {MAX_LEVERAGE}x)")
     print(f"  MIN_SCORE: {MIN_SCORE}")
     print(f"  tvDatafeed: {'ON' if tv_available() and USE_TV_FEED else 'OFF'}")
     print("=" * 60)
